@@ -1,174 +1,372 @@
-# app.py
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
 from statsmodels.tsa.arima.model import ARIMA
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, LSTM, Dense
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LinearRegression
 
-# ---------------- UI CONFIG ----------------
-st.set_page_config(page_title="AI-Driven Bond Yield Forecasting", layout="wide")
-st.title("AI-Driven Bond Yield Forecasting")
-st.subheader("Hybrid ARIMA + Two-Head LSTM for Government Bond Yields")
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
 
-# ---------------- UPLOAD ----------------
-uploaded_file = st.file_uploader("Upload Bond Yield CSV", type=["csv"])
+# ---------------- UI ----------------
 
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
+st.set_page_config(page_title="Bond Yield Forecasting", layout="wide")
 
-    # Standardize column names
+st.title("AI Driven Bond Yield Forecasting")
+st.subheader("Comparative Study of Forecasting Models")
+
+# ---------------- METRICS ----------------
+
+def directional_accuracy(actual, predicted):
+
+    actual_diff = np.sign(np.diff(actual))
+    pred_diff = np.sign(np.diff(predicted))
+
+    return np.mean(actual_diff == pred_diff) * 100
+
+
+def compute_metrics(actual, predicted):
+
+    mae = mean_absolute_error(actual, predicted)
+    mse = mean_squared_error(actual, predicted)
+    da = directional_accuracy(actual, predicted)
+
+    return mae, mse, da
+
+
+# ---------------- GRAPH ----------------
+
+def plot_graph(series, future_dates, forecast, title):
+
+    plt.figure(figsize=(10,4))
+
+    plt.plot(series.index, series.values, label="Actual")
+
+    plt.plot(future_dates, forecast, label="Predicted")
+
+    plt.title(title)
+
+    plt.xlabel("Date")
+    plt.ylabel("Bond Yield")
+
+    plt.legend()
+
+    st.pyplot(plt)
+
+
+# ---------------- FILE UPLOAD ----------------
+
+file = st.file_uploader("Upload Bond Yield CSV", type=["csv"])
+
+if file:
+
+    df = pd.read_csv(file)
+
     df.columns = [c.strip().upper() for c in df.columns]
 
-    if "DATE" not in df.columns:
-        st.error("CSV must contain a DATE column")
-        st.stop()
-
-    # Identify bond columns (everything except DATE)
-    bond_columns = [c for c in df.columns if c != "DATE"]
-
-    if len(bond_columns) == 0:
-        st.error("No bond yield columns found")
-        st.stop()
-
-    # -------- Bond Selection --------
-    selected_bond = st.selectbox(
-        "Select Bond Maturity",
-        bond_columns
-    )
-
-    # -------- Data Cleaning --------
     df["DATE"] = pd.to_datetime(df["DATE"])
-    df = df[["DATE", selected_bond]]
-    df.rename(columns={selected_bond: "YIELD"}, inplace=True)
+
+    bonds = [c for c in df.columns if c != "DATE"]
+
+    bond = st.selectbox("Select Bond Maturity", bonds)
+
+    df = df[["DATE", bond]]
+
+    df.rename(columns={bond:"YIELD"}, inplace=True)
+
     df.dropna(inplace=True)
+
     df.set_index("DATE", inplace=True)
 
     series = df["YIELD"]
 
-    st.subheader("Data Preview (Selected Bond Only)")
+    st.write("Dataset Preview")
     st.dataframe(df.head())
 
-    n_days = st.number_input("Days to Forecast", 1, 365, 60)
+    forecast_days = st.number_input("Forecast Days", 1, 1000, 30)
 
-    # ---------------- SUBMIT ----------------
-    if st.button("Submit Forecast"):
-        st.info("Training models and generating forecasts...")
+    if st.button("Run Forecast"):
 
-        # -------- Train / Test Split --------
-        split = int(len(series) * 0.8)
-        train, test = series[:split], series[split:]
+        last_date = series.index[-1]
 
-        # ================= ARIMA =================
-        arima = ARIMA(train, order=(5,1,0))
-        arima_fit = arima.fit()
-
-        arima_test_pred = arima_fit.forecast(steps=len(test))
-        arima_future = arima_fit.forecast(steps=n_days)
-
-        # ================= RESIDUALS =================
-        arima_train_pred = arima_fit.predict(
-            start=train.index[0],
-            end=train.index[-1]
-        )
-
-        residuals = train.values - arima_train_pred.values
-
-        # ================= SCALING =================
-        scaler = MinMaxScaler()
-        residuals_scaled = scaler.fit_transform(residuals.reshape(-1,1))
-
-        # ================= TWO-HEAD LSTM =================
-        seq_len = 20
-
-        X_level, X_diff, y = [], [], []
-
-        for i in range(seq_len, len(residuals_scaled)):
-            level = residuals_scaled[i-seq_len:i, 0]
-            diff = np.diff(level, prepend=level[0])
-            X_level.append(level)
-            X_diff.append(diff)
-            y.append(residuals_scaled[i, 0])
-
-        X_level = np.array(X_level).reshape(-1, seq_len, 1)
-        X_diff = np.array(X_diff).reshape(-1, seq_len, 1)
-        y = np.array(y)
-
-        # ---- Two LSTM Heads ----
-        input_level = Input(shape=(seq_len,1))
-        input_diff = Input(shape=(seq_len,1))
-
-        lstm_level = LSTM(32)(input_level)
-        lstm_diff = LSTM(32)(input_diff)
-
-        merged = Dense(32, activation="relu")(lstm_level + lstm_diff)
-        output = Dense(1)(merged)
-
-        model = Model(inputs=[input_level, input_diff], outputs=output)
-        model.compile(optimizer="adam", loss="mse")
-        model.fit([X_level, X_diff], y, epochs=20, batch_size=16, verbose=0)
-
-        # ================= FUTURE RESIDUALS =================
-        last_level = residuals_scaled[-seq_len:].reshape(1, seq_len, 1)
-        last_diff = np.diff(last_level[0,:,0], prepend=last_level[0,0,0]).reshape(1, seq_len, 1)
-
-        future_res = []
-
-        for _ in range(n_days):
-            pred = model.predict([last_level, last_diff], verbose=0)[0][0]
-            future_res.append(pred)
-
-            last_level = np.append(last_level[:,1:,:], [[[pred]]], axis=1)
-            last_diff = np.diff(last_level[0,:,0], prepend=last_level[0,0,0]).reshape(1, seq_len, 1)
-
-        future_res = scaler.inverse_transform(
-            np.array(future_res).reshape(-1,1)
-        ).flatten()
-
-        hybrid_future = arima_future.values + future_res
-
-        # ================= METRICS =================
-        mae = mean_absolute_error(test.values, arima_test_pred.values)
-        rmse = np.sqrt(mean_squared_error(test.values, arima_test_pred.values))
-
-        st.subheader("Accuracy (ARIMA Baseline)")
-        st.write(f"MAE: {mae:.4f}")
-        st.write(f"RMSE: {rmse:.4f}")
-
-        # ================= DATES =================
         future_dates = pd.date_range(
-            series.index[-1],
-            periods=n_days+1,
+            last_date,
+            periods=forecast_days+1,
             freq="D"
         )[1:]
 
-        # ================= PLOTS =================
-        st.subheader("ARIMA Forecast")
-        plt.figure(figsize=(10,4))
-        plt.plot(series.index, series.values, label="Historical")
-        plt.plot(future_dates, arima_future.values, label="ARIMA Forecast")
-        plt.legend()
-        st.pyplot(plt)
+        results = []
 
-        st.subheader("Two-Head LSTM (Hybrid) Forecast")
-        plt.figure(figsize=(10,4))
-        plt.plot(series.index, series.values, label="Historical")
-        plt.plot(future_dates, hybrid_future, label="Hybrid Forecast")
-        plt.legend()
-        st.pyplot(plt)
+# =====================================================
+# 1 ARIMA
+# =====================================================
 
-        # ================= FINAL TABLE =================
-        st.subheader("Forecast Results")
-        result_df = pd.DataFrame({
-            "Date": future_dates,
-            "ARIMA Forecast": arima_future.values,
-            "Two-Head LSTM Forecast": hybrid_future
-        })
-        st.dataframe(result_df)
+        arima = ARIMA(series, order=(5,1,0))
+        arima_fit = arima.fit()
 
-        st.success("Forecast completed successfully!")
+        arima_forecast = arima_fit.forecast(steps=forecast_days)
+
+        mae, mse, da = compute_metrics(
+            series[-forecast_days:].values,
+            arima_forecast[:forecast_days].values
+        )
+
+        st.header("ARIMA Forecast")
+
+        st.write("MAE:", mae)
+        st.write("MSE:", mse)
+        st.write("Directional Accuracy:", da)
+
+        plot_graph(series, future_dates, arima_forecast.values,
+                   "ARIMA Bond Yield Forecast")
+
+        results.append(["ARIMA", mae, mse, da])
+
+# =====================================================
+# 2 PCA MODEL
+# =====================================================
+
+        scaler = MinMaxScaler()
+
+        scaled = scaler.fit_transform(series.values.reshape(-1,1))
+
+        pca = PCA(n_components=1)
+
+        pca_values = pca.fit_transform(scaled)
+
+        X = pca_values[:-1]
+        y = series.values[1:]
+
+        model = LinearRegression()
+
+        model.fit(X, y)
+
+        last_val = pca_values[-1].reshape(1,-1)
+
+        pca_forecast = []
+
+        for i in range(forecast_days):
+
+            pred = model.predict(last_val)[0]
+
+            pca_forecast.append(pred)
+
+        pca_forecast = np.array(pca_forecast)
+
+        mae, mse, da = compute_metrics(
+            series[-forecast_days:].values,
+            pca_forecast[:forecast_days]
+        )
+
+        st.header("PCA Regression Forecast")
+
+        st.write("MAE:", mae)
+        st.write("MSE:", mse)
+        st.write("Directional Accuracy:", da)
+
+        plot_graph(series, future_dates, pca_forecast,
+                   "PCA Bond Yield Forecast")
+
+        results.append(["PCA Regression", mae, mse, da])
+
+# =====================================================
+# 3 LSTM MODEL
+# =====================================================
+
+        scaler = MinMaxScaler()
+
+        scaled = scaler.fit_transform(series.values.reshape(-1,1))
+
+        seq = 20
+
+        X = []
+        y = []
+
+        for i in range(seq, len(scaled)):
+
+            X.append(scaled[i-seq:i])
+            y.append(scaled[i])
+
+        X = np.array(X)
+        y = np.array(y)
+
+        model = Sequential()
+
+        model.add(LSTM(32, input_shape=(seq,1)))
+        model.add(Dense(1))
+
+        model.compile(optimizer="adam", loss="mse")
+
+        model.fit(X, y, epochs=10, verbose=0)
+
+        last_seq = scaled[-seq:]
+
+        lstm_forecast = []
+
+        current = last_seq.copy()
+
+        for i in range(forecast_days):
+
+            pred = model.predict(current.reshape(1,seq,1))[0]
+
+            lstm_forecast.append(pred)
+
+            current = np.append(current[1:], pred)
+
+        lstm_forecast = scaler.inverse_transform(
+            np.array(lstm_forecast).reshape(-1,1)
+        ).flatten()
+
+        mae, mse, da = compute_metrics(
+            series[-forecast_days:].values,
+            lstm_forecast[:forecast_days]
+        )
+
+        st.header("LSTM Forecast")
+
+        st.write("MAE:", mae)
+        st.write("MSE:", mse)
+        st.write("Directional Accuracy:", da)
+
+        plot_graph(series, future_dates, lstm_forecast,
+                   "LSTM Bond Yield Forecast")
+
+        results.append(["LSTM", mae, mse, da])
+
+# =====================================================
+# 4 MULTIVARIATE MODEL
+# =====================================================
+
+        df_lag = df.copy()
+
+        for lag in range(1,4):
+            df_lag[f"LAG{lag}"] = df_lag["YIELD"].shift(lag)
+
+        df_lag.dropna(inplace=True)
+
+        X = df_lag.drop("YIELD", axis=1)
+        y = df_lag["YIELD"]
+
+        model = LinearRegression()
+
+        model.fit(X, y)
+
+        last_row = X.iloc[-1].values.reshape(1,-1)
+
+        multi_forecast = []
+
+        for i in range(forecast_days):
+
+            pred = model.predict(last_row)[0]
+
+            multi_forecast.append(pred)
+
+        multi_forecast = np.array(multi_forecast)
+
+        mae, mse, da = compute_metrics(
+            series[-forecast_days:].values,
+            multi_forecast[:forecast_days]
+        )
+
+        st.header("Multivariate Regression Forecast")
+
+        st.write("MAE:", mae)
+        st.write("MSE:", mse)
+        st.write("Directional Accuracy:", da)
+
+        plot_graph(series, future_dates, multi_forecast,
+                   "Multivariate Bond Yield Forecast")
+
+        results.append(["Multivariate", mae, mse, da])
+
+# =====================================================
+# 5 HYBRID MODEL
+# =====================================================
+
+        residuals = series.values - arima_fit.predict().values
+
+        scaler = MinMaxScaler()
+
+        scaled_res = scaler.fit_transform(
+            residuals.reshape(-1,1)
+        )
+
+        seq = 20
+
+        X = []
+        y = []
+
+        for i in range(seq, len(scaled_res)):
+
+            X.append(scaled_res[i-seq:i])
+            y.append(scaled_res[i])
+
+        X = np.array(X)
+        y = np.array(y)
+
+        model = Sequential()
+
+        model.add(LSTM(32, input_shape=(seq,1)))
+        model.add(Dense(1))
+
+        model.compile(optimizer="adam", loss="mse")
+
+        model.fit(X, y, epochs=10, verbose=0)
+
+        last_seq = scaled_res[-seq:]
+
+        res_forecast = []
+
+        current = last_seq.copy()
+
+        for i in range(forecast_days):
+
+            pred = model.predict(current.reshape(1,seq,1))[0]
+
+            res_forecast.append(pred)
+
+            current = np.append(current[1:], pred)
+
+        res_forecast = scaler.inverse_transform(
+            np.array(res_forecast).reshape(-1,1)
+        ).flatten()
+
+        hybrid_forecast = arima_forecast.values + res_forecast
+
+        mae, mse, da = compute_metrics(
+            series[-forecast_days:].values,
+            hybrid_forecast[:forecast_days]
+        )
+
+        st.header("Hybrid ARIMA + LSTM Forecast")
+
+        st.write("MAE:", mae)
+        st.write("MSE:", mse)
+        st.write("Directional Accuracy:", da)
+
+        plot_graph(series, future_dates, hybrid_forecast,
+                   "Hybrid Bond Yield Forecast")
+
+        results.append(["Hybrid ARIMA + LSTM", mae, mse, da])
+
+# =====================================================
+# COMPARISON TABLE
+# =====================================================
+
+        st.header("Model Comparison")
+
+        table = pd.DataFrame(
+            results,
+            columns=[
+                "Model",
+                "MAE",
+                "MSE",
+                "Directional Accuracy"
+            ]
+        )
+
+        st.dataframe(table)
